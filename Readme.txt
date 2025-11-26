@@ -24,3 +24,27 @@ sudo cat /etc/rancher/k3s/k3s.yaml
 mkdir -p ~/.kube
 nano ~/.kube/config
 
+- start kubernetes dashboard
+nohup sudo kubectl -n kubernetes-dashboard port-forward --address=0.0.0.0 svc/kubernetes-dashboard 8443:443 > dashboard.log 2>&1 &
+
+or
+
+- auto start
+sudo nano /etc/systemd/system/k8s-dashboard-portforward.service
+
+paste this:
+[Unit]
+Description=K3s Dashboard Port Forward
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/local/bin/kubectl -n kubernetes-dashboard port-forward --address=0.0.0.0 svc/kubernetes-dashboard 8443:443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+
+save, then:
+sudo systemctl daemon-reload
+sudo systemctl enable --now k8s-dashboard-portforward

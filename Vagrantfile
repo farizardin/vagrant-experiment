@@ -7,7 +7,10 @@ Vagrant.configure("2") do |config|
     libvirt.cpus = 2
   end
 
-  # Master Node
+  # ===========================================================
+  # K3S CLUSTER
+  # ===========================================================
+
   config.vm.define "k3s-master" do |master|
     master.vm.hostname = "k3s-master"
     master.vm.network "private_network", ip: "192.168.56.10"
@@ -17,7 +20,7 @@ Vagrant.configure("2") do |config|
       curl -sfL https://get.k3s.io | \
         INSTALL_K3S_EXEC="server --node-ip=192.168.56.10" sh -
 
-      echo "[MASTER] Token:"
+      echo "[MASTER] Node Token:"
       sudo cat /var/lib/rancher/k3s/server/node-token
     SHELL
   end
@@ -32,5 +35,163 @@ Vagrant.configure("2") do |config|
   config.vm.define "k3s-worker-2" do |worker|
     worker.vm.hostname = "k3s-worker-2"
     worker.vm.network "private_network", ip: "192.168.56.12"
+  end
+
+  # ===========================================================
+  # POSTGRES DEV NODE
+  # ===========================================================
+
+  config.vm.define "db-dev" do |db|
+    db.vm.hostname = "db-dev"
+    db.vm.network "private_network", ip: "192.168.56.20"
+
+    db.vm.synced_folder "./data/db-dev", "/var/lib/postgresql/data"
+
+    db.vm.provision "shell", inline: <<-SHELL
+      echo "[DB-DEV] Installing PostgreSQL..."
+      sudo apt-get update
+      sudo apt-get install -y postgresql postgresql-contrib
+
+      sudo systemctl stop postgresql
+      sudo rsync -a /var/lib/postgresql/ /var/lib/postgresql/data/
+      sudo chown -R postgres:postgres /var/lib/postgresql/data
+
+      sudo sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '*'/" /etc/postgresql/*/main/postgresql.conf
+      echo "host all all 192.168.56.0/24 md5" | sudo tee -a /etc/postgresql/*/main/pg_hba.conf
+      sudo systemctl restart postgresql
+
+      sudo -u postgres psql -c "CREATE USER devuser WITH PASSWORD 'devpass';" || true
+      sudo -u postgres psql -c "CREATE DATABASE devdb OWNER devuser;" || true
+    SHELL
+  end
+
+  # ===========================================================
+  # ELK + APM NODE WITH SECURITY
+  # ===========================================================
+
+  config.vm.define "elastic-node" do |db|
+    db.vm.hostname = "elastic-node"
+    db.vm.network "private_network", ip: "192.168.56.21"
+
+    db.vm.network "forwarded_port", guest: 5601, host: 5601
+    db.vm.network "forwarded_port", guest: 9200, host: 9200
+    db.vm.network "forwarded_port", guest: 8200, host: 8200
+
+    db.vm.synced_folder "./data/elastic-node/elasticsearch", "/var/lib/elasticsearch-data"
+    db.vm.synced_folder "./data/elastic-node/kibana", "/var/lib/kibana-data"
+    db.vm.synced_folder "./data/elastic-node/logstash", "/var/lib/logstash-data"
+    db.vm.synced_folder "./data/elastic-node/apm-server", "/var/lib/apm-server-data"
+
+    db.vm.provision "shell", inline: <<-SHELL
+      echo "[ELASTIC-NODE] Installing ELK + APM..."
+
+      sudo apt-get update
+      sudo apt-get install -y openjdk-11-jdk wget apt-transport-https gnupg pwgen
+
+      wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch | \
+        sudo gpg --dearmor -o /usr/share/keyrings/elasticsearch.gpg
+
+      echo "deb [signed-by=/usr/share/keyrings/elasticsearch.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main" \
+        | sudo tee /etc/apt/sources.list.d/elasticsearch.list
+
+      sudo apt-get update
+      sudo apt-get install -y elasticsearch kibana logstash apm-server
+
+      ENC_KEY=$(pwgen -s 32 1)
+      KIBANA_PASS=$(pwgen -s 16 1)
+
+      echo "[*] Encryption key: $ENC_KEY"
+      echo "[*] kibana_system password (temp): $KIBANA_PASS"
+
+      # ======================================================
+      # Elasticsearch config
+      # ======================================================
+
+      cat <<EOF | sudo tee /etc/elasticsearch/elasticsearch.yml
+cluster.name: vagrant-elk
+node.name: elastic-node
+
+path.data: /var/lib/elasticsearch-data
+path.logs: /var/log/elasticsearch
+
+network.host: 0.0.0.0
+discovery.type: single-node
+
+xpack.security.enabled: true
+xpack.security.enrollment.enabled: true
+xpack.security.http.ssl.enabled: false
+xpack.security.transport.ssl.enabled: false
+EOF
+
+      sudo chown -R elasticsearch:elasticsearch /var/lib/elasticsearch-data
+      sudo systemctl enable elasticsearch
+      sudo systemctl restart elasticsearch
+
+      sleep 10
+
+      # temp reset kibana_system user
+      sudo /usr/share/elasticsearch/bin/elasticsearch-reset-password \
+        -u kibana_system -b <<< "$KIBANA_PASS"
+
+      # ======================================================
+      # Kibana config
+      # ======================================================
+      cat <<EOF | sudo tee /etc/kibana/kibana.yml
+server.host: "0.0.0.0"
+
+elasticsearch.hosts: ["http://localhost:9200"]
+elasticsearch.username: "kibana_system"
+elasticsearch.password: "$KIBANA_PASS"
+
+# xpack.security.enabled: true
+xpack.encryptedSavedObjects.encryptionKey: "$ENC_KEY"
+
+xpack.fleet.agents.elasticsearch.host: "http://localhost:9200"
+xpack.fleet.agents.enabled: true
+EOF
+
+      sudo systemctl enable kibana
+      sudo systemctl restart kibana
+
+      # ======================================================
+      # Logstash
+      # ======================================================
+      sudo mkdir -p /etc/logstash/conf.d
+
+      cat <<EOF | sudo tee /etc/logstash/conf.d/logstash.conf
+input { beats { port => 5044 } }
+output { stdout { codec => rubydebug } }
+EOF
+
+      sudo systemctl enable logstash
+      sudo systemctl restart logstash
+
+      # ======================================================
+      # APM Server
+      # ======================================================
+      cat <<EOF | sudo tee /etc/apm-server/apm-server.yml
+apm-server:
+  host: "0.0.0.0:8200"
+
+output.elasticsearch:
+  hosts: ["http://localhost:9200"]
+  username: "elastic"
+  password: "changeme"
+
+setup.kibana:
+  host: "http://localhost:5601"
+EOF
+
+      sudo systemctl enable apm-server
+      sudo systemctl restart apm-server
+
+      echo "====================================================="
+      echo " ELK SECURITY SETUP DONE"
+      echo " Kibana password for kibana_system: $KIBANA_PASS"
+      echo " Encryption key: $ENC_KEY"
+      echo " IMPORTANT: reset Elastic password manually:"
+      echo " sudo /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic"
+      echo "====================================================="      
+    SHELL
   end
 end
