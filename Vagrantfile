@@ -37,6 +37,11 @@ Vagrant.configure("2") do |config|
     worker.vm.network "private_network", ip: "192.168.56.12"
   end
 
+  config.vm.define "k3s-worker-3" do |worker|
+    worker.vm.hostname = "k3s-worker-3"
+    worker.vm.network "private_network", ip: "192.168.56.13"
+  end
+
   # ===========================================================
   # POSTGRES DEV NODE
   # ===========================================================
@@ -64,26 +69,33 @@ Vagrant.configure("2") do |config|
       sudo -u postgres psql -c "CREATE DATABASE devdb OWNER devuser;" || true
     SHELL
   end
-
   # ===========================================================
-  # ELK + APM NODE WITH SECURITY
+  # ELK + APM NODE WITH SECURITY (FIXED)
   # ===========================================================
+  config.vm.define "elastic-node" do |node|
+    node.vm.hostname = "elastic-node"
+    node.vm.network "private_network", ip: "192.168.56.21"
 
-  config.vm.define "elastic-node" do |db|
-    db.vm.hostname = "elastic-node"
-    db.vm.network "private_network", ip: "192.168.56.21"
+    # Forward ports
+    node.vm.network "forwarded_port", guest: 5601, host: 5601
+    node.vm.network "forwarded_port", guest: 9200, host: 9200
+    node.vm.network "forwarded_port", guest: 8200, host: 8200
 
-    db.vm.network "forwarded_port", guest: 5601, host: 5601
-    db.vm.network "forwarded_port", guest: 9200, host: 9200
-    db.vm.network "forwarded_port", guest: 8200, host: 8200
+    # ============================
+    # SAFE synced folders (optional)
+    # ============================
+    # Elasticsearch data MUST NOT be synced
+    # node.vm.synced_folder "./data/elasticsearch", "/var/lib/elasticsearch-data", disabled: true
 
-    db.vm.synced_folder "./data/elastic-node/elasticsearch", "/var/lib/elasticsearch-data"
-    db.vm.synced_folder "./data/elastic-node/kibana", "/var/lib/kibana-data"
-    db.vm.synced_folder "./data/elastic-node/logstash", "/var/lib/logstash-data"
-    db.vm.synced_folder "./data/elastic-node/apm-server", "/var/lib/apm-server-data"
+    node.vm.synced_folder "./data/elastic-node/kibana", "/var/lib/kibana-data"
+    node.vm.synced_folder "./data/elastic-node/logstash", "/var/lib/logstash-data"
+    node.vm.synced_folder "./data/elastic-node/apm-server", "/var/lib/apm-server-data"
 
-    db.vm.provision "shell", inline: <<-SHELL
-      echo "[ELASTIC-NODE] Installing ELK + APM..."
+    # ===========================================================
+    # PROVISION SCRIPT
+    # ===========================================================
+    node.vm.provision "shell", inline: <<-SHELL
+      echo "[ELK] Installing..."
 
       sudo apt-get update
       sudo apt-get install -y openjdk-11-jdk wget apt-transport-https gnupg pwgen
@@ -104,8 +116,10 @@ Vagrant.configure("2") do |config|
       echo "[*] kibana_system password (temp): $KIBANA_PASS"
 
       # ======================================================
-      # Elasticsearch config
+      # FIXED: Elasticsearch config
       # ======================================================
+      sudo mkdir -p /var/lib/elasticsearch-data
+      sudo chown elasticsearch:elasticsearch /var/lib/elasticsearch-data
 
       cat <<EOF | sudo tee /etc/elasticsearch/elasticsearch.yml
 cluster.name: vagrant-elk
@@ -157,8 +171,7 @@ EOF
       # Logstash
       # ======================================================
       sudo mkdir -p /etc/logstash/conf.d
-
-      cat <<EOF | sudo tee /etc/logstash/conf.d/logstash.conf
+      cat <<EOF | sudo tee /etc/logstash/conf.d/pipeline.conf
 input { beats { port => 5044 } }
 output { stdout { codec => rubydebug } }
 EOF
@@ -167,7 +180,7 @@ EOF
       sudo systemctl restart logstash
 
       # ======================================================
-      # APM Server
+      # APM Server config
       # ======================================================
       cat <<EOF | sudo tee /etc/apm-server/apm-server.yml
 apm-server:
@@ -189,9 +202,9 @@ EOF
       echo " ELK SECURITY SETUP DONE"
       echo " Kibana password for kibana_system: $KIBANA_PASS"
       echo " Encryption key: $ENC_KEY"
-      echo " IMPORTANT: reset Elastic password manually:"
+      echo "IMPORTANT: Reset Elastic password:"
       echo " sudo /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic"
-      echo "====================================================="      
+      echo "====================================================="
     SHELL
   end
 end
